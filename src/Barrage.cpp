@@ -32,7 +32,6 @@ struct Barrage : Module {
 	};
 	enum LightId {
 		ENUMS(STEP_LIGHT, NUM_STEPS),
-		DIRECTION_LIGHT,
 		LIGHTS_LEN
 	};
 
@@ -48,9 +47,10 @@ struct Barrage : Module {
 	float samplesSinceClock  = 0.f;
 
 	// Burst state for the current step
-	bool  stepActive  = false;
-	int   burstTotal  = 1;
-	float burstLength = 0.5f;
+	bool  stepActive       = false;
+	int   burstTotal       = 1;
+	float burstLength      = 0.5f;
+	bool  pingPongForward  = true;
 
 	Barrage() {
 		config(PARAMS_LEN, INPUTS_LEN, OUTPUTS_LEN, LIGHTS_LEN);
@@ -63,7 +63,7 @@ struct Barrage : Module {
 		}
 
 		configParam(SEQ_LENGTH_PARAM, 1.f, 16.f, 16.f, "Sequence Length", " steps")->snapEnabled = true;
-		configButton(DIRECTION_PARAM, "Direction");
+		configSwitch(DIRECTION_PARAM, 0.f, 3.f, 0.f, "Direction", {"Forward", "Reverse", "Ping-pong", "Random"});
 
 		configInput(CLOCK_INPUT, "Clock");
 		configInput(RESET_INPUT, "Reset");
@@ -81,8 +81,8 @@ struct Barrage : Module {
 	}
 
 	void process(const ProcessArgs& args) override {
-		int  seqLength = clamp((int)std::round(params[SEQ_LENGTH_PARAM].getValue()), 1, NUM_STEPS);
-		bool reverse   = params[DIRECTION_PARAM].getValue() > 0.5f;
+		int seqLength = clamp((int)std::round(params[SEQ_LENGTH_PARAM].getValue()), 1, NUM_STEPS);
+		int dirMode   = (int)std::round(params[DIRECTION_PARAM].getValue()); // 0=fwd 1=rev 2=pingpong 3=random
 
 		// Keep currentStep in bounds if seqLength was reduced
 		if (currentStep >= seqLength)
@@ -90,8 +90,9 @@ struct Barrage : Module {
 
 		// ── Reset ────────────────────────────────────────────────────────────
 		if (resetTrigger.process(inputs[RESET_INPUT].getVoltage(), 0.1f, 2.f)) {
-			currentStep = -1;
-			stepActive  = false;
+			currentStep      = -1;
+			stepActive       = false;
+			pingPongForward  = true;
 		}
 
 		// ── Clock ────────────────────────────────────────────────────────────
@@ -101,20 +102,49 @@ struct Barrage : Module {
 				clockPeriod = samplesSinceClock;
 			samplesSinceClock = 0.f;
 
-			// Advance step; only fire EOC when a full cycle has already started
 			int prevStep = currentStep;
-			if (reverse) {
-				currentStep--;
-				if (currentStep < 0) {
-					currentStep = seqLength - 1;
-					if (prevStep >= 0) eocPulse.trigger(1e-3f);
-				}
-			} else {
-				currentStep++;
-				if (currentStep >= seqLength) {
-					currentStep = 0;
-					if (prevStep >= 0) eocPulse.trigger(1e-3f);
-				}
+
+			switch (dirMode) {
+				case 0: // Forward
+					currentStep++;
+					if (currentStep >= seqLength) {
+						currentStep = 0;
+						if (prevStep >= 0) eocPulse.trigger(1e-3f);
+					}
+					break;
+
+				case 1: // Reverse
+					currentStep--;
+					if (currentStep < 0) {
+						currentStep = seqLength - 1;
+						if (prevStep >= 0) eocPulse.trigger(1e-3f);
+					}
+					break;
+
+				case 2: // Ping-pong
+					if (currentStep < 0) {
+						currentStep     = 0;
+						pingPongForward = true;
+					} else if (pingPongForward) {
+						currentStep++;
+						if (currentStep >= seqLength) {
+							pingPongForward = false;
+							currentStep     = std::max(seqLength - 2, 0);
+						}
+					} else {
+						currentStep--;
+						if (currentStep < 0) {
+							pingPongForward = true;
+							currentStep     = std::min(1, seqLength - 1);
+							if (prevStep >= 0) eocPulse.trigger(1e-3f);
+						}
+					}
+					break;
+
+				case 3: // Random
+				default:
+					currentStep = (int)(random::uniform() * seqLength);
+					break;
 			}
 
 			// Probability gate
@@ -158,7 +188,6 @@ struct Barrage : Module {
 		// ── Lights ───────────────────────────────────────────────────────────
 		for (int i = 0; i < NUM_STEPS; i++)
 			lights[STEP_LIGHT + i].setBrightness(i == currentStep ? 1.f : 0.f);
-		lights[DIRECTION_LIGHT].setBrightness(reverse ? 1.f : 0.f);
 	}
 };
 
@@ -393,8 +422,7 @@ struct BarrageWidget : ModuleWidget {
 		addParam(createParamCentered<RoundBlackKnob>(Vec(75.f, 230.f), module, Barrage::SEQ_LENGTH_PARAM));
 
 		// Direction toggle button  (x=150, y=230)
-		addParam(createLightParamCentered<VCVLightLatch<MediumSimpleLight<WhiteLight>>>(
-			Vec(150.f, 230.f), module, Barrage::DIRECTION_PARAM, Barrage::DIRECTION_LIGHT));
+		addParam(createParamCentered<RoundBlackSnapKnob>(Vec(150.f, 230.f), module, Barrage::DIRECTION_PARAM));
 
 		// ── Gate outputs — one per step, aligned to step columns ────────────
 		for (int i = 0; i < NUM_STEPS; i++) {

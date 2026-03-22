@@ -27,7 +27,7 @@ Barrage is a 16-step sequencer where each step is a self-contained burst generat
 | Control | Description |
 |---------|-------------|
 | **STEPS** | Number of active steps in the sequence (1–16, integer) |
-| **DIR** | Forward / reverse toggle (latching) |
+| **DIR** | Direction mode knob — selects Forward, Reverse, Ping-pong, or Random |
 
 ### Inputs
 
@@ -42,7 +42,7 @@ Barrage is a 16-step sequencer where each step is a self-contained burst generat
 |------|-------------|
 | **GATE 1–16** | Per-step burst gate output |
 | **EOC 1–16** | Fires a pulse when that step's burst completes |
-| **EOC** | Fires a pulse at the end of each full sequence cycle |
+| **EOC** | Fires a pulse at the end of each full sequence cycle (not fired in Random mode) |
 | **STEP CV** | Current step as a 0–10 V CV value (0 V = step 1, 10 V = step 16) |
 
 ---
@@ -53,6 +53,15 @@ On each rising clock edge Barrage advances to the next active step, rolls agains
 
 Each step has its own **GATE** output, so all 16 burst generators can be routed independently to different instruments or modules simultaneously.
 
+The **DIR** knob selects one of four direction modes:
+
+| Mode | Behaviour | EOC |
+|------|-----------|-----|
+| **Forward** | Steps advance 1 → 2 → … → N → 1 | Fires on wrap |
+| **Reverse** | Steps advance N → N-1 → … → 1 → N | Fires on wrap |
+| **Ping-pong** | Steps bounce 1 → N → 1 → N → … without repeating endpoints | Fires when bouncing off step 1 |
+| **Random** | A random step is chosen on each clock | Never fires |
+
 ---
 
 ## Tips
@@ -60,7 +69,7 @@ Each step has its own **GATE** output, so all 16 burst generators can be routed 
 - Patch **STEP CV** into a quantizer or V/Oct input to turn the sequencer into a melodic line driven by burst rhythm.
 - Use **EOC 1–16** to chain modules or trigger envelopes at the moment each burst finishes rather than when it starts.
 - Set **SPEED** above 1× with **COUNT** > 1 to pack many fast gates into a single clock step; set it below 1× for slow, sparse single gates that trail into the next step.
-- Run two instances with opposite **DIR** settings clocked together for polyrhythmic textures.
+- Clock two instances together with different **DIR** modes — e.g. one in Forward and one in Ping-pong — for evolving polyrhythmic textures.
 
 ---
 
