@@ -46,11 +46,13 @@ struct Barrage : Module {
 	float clockPeriod        = 0.f; // set by onSampleRateChange before first process()
 	float samplesSinceClock  = 0.f;
 
-	// Burst state for the current step
-	bool  stepActive       = false;
-	int   burstTotal       = 1;
-	float burstLength      = 0.5f;
-	bool  pingPongForward  = true;
+	// Per-step burst state — allows slow bursts to outlive their clock slot
+	bool  stepBurstActive[NUM_STEPS]  = {};
+	float stepBurstSamples[NUM_STEPS] = {};
+	int   stepBurstTotal[NUM_STEPS]   = {};
+	float stepBurstLength[NUM_STEPS]  = {};
+	float stepBurstSpeed[NUM_STEPS]   = {};
+	bool  pingPongForward              = true;
 
 	Barrage() {
 		config(PARAMS_LEN, INPUTS_LEN, OUTPUTS_LEN, LIGHTS_LEN);
@@ -90,9 +92,10 @@ struct Barrage : Module {
 
 		// ── Reset ────────────────────────────────────────────────────────────
 		if (resetTrigger.process(inputs[RESET_INPUT].getVoltage(), 0.1f, 2.f)) {
-			currentStep      = -1;
-			stepActive       = false;
-			pingPongForward  = true;
+			currentStep     = -1;
+			pingPongForward = true;
+			for (int i = 0; i < NUM_STEPS; i++)
+				stepBurstActive[i] = false;
 		}
 
 		// ── Clock ────────────────────────────────────────────────────────────
@@ -148,38 +151,36 @@ struct Barrage : Module {
 			}
 
 			// Probability gate
-			stepActive = (random::uniform() < params[PROB_PARAM + currentStep].getValue());
-
-			if (stepActive) {
-				burstTotal  = clamp((int)std::round(params[COUNT_PARAM + currentStep].getValue()), 1, NUM_STEPS);
-				// Clamp below 1 so adjacent gates always have a gap between them
-				burstLength = std::min(params[LENGTH_PARAM + currentStep].getValue(), 0.9999f);
+			if (random::uniform() < params[PROB_PARAM + currentStep].getValue()) {
+				stepBurstActive[currentStep]  = true;
+				stepBurstSamples[currentStep] = 0.f;
+				stepBurstTotal[currentStep]   = clamp((int)std::round(params[COUNT_PARAM + currentStep].getValue()), 1, NUM_STEPS);
+				stepBurstLength[currentStep]  = std::min(params[LENGTH_PARAM + currentStep].getValue(), 0.9999f);
+				stepBurstSpeed[currentStep]   = params[SPEED_PARAM + currentStep].getValue();
 			}
 		}
 
 		samplesSinceClock += 1.f;
 
-		// ── Burst gate ───────────────────────────────────────────────────────
-		// Compute phase from elapsed samples — no accumulation, no float drift.
-		// phase ramps 0 → burstTotal over one clock period; each integer interval
-		// is one gate, high for the leading burstLength fraction of that interval.
-		bool gateHigh = false;
-		if (stepActive && clockPeriod > 0.f) {
-			float speed      = params[SPEED_PARAM + currentStep].getValue();
-			float phase      = samplesSinceClock * (float)burstTotal * speed / clockPeriod;
-			float prevPhase  = (samplesSinceClock - 1.f) * (float)burstTotal * speed / clockPeriod;
-			float liveLength = std::min(params[LENGTH_PARAM + currentStep].getValue(), 0.9999f);
-			float subPhase   = std::fmod(phase, 1.f);
-			gateHigh = (phase < (float)burstTotal) && (subPhase < liveLength);
-
-			// Fire burst EOC on the sample the burst completes
-			if (prevPhase < (float)burstTotal && phase >= (float)burstTotal)
-				burstEocPulses[currentStep].trigger(1e-3f);
-		}
-
-		// ── Outputs ──────────────────────────────────────────────────────────
+		// ── Per-step burst gates ─────────────────────────────────────────────
+		// Each step tracks its own burst independently, so slow bursts (SPEED < 1)
+		// continue firing on their output even after the sequencer has moved on.
 		for (int i = 0; i < NUM_STEPS; i++) {
-			outputs[GATE_OUTPUT      + i].setVoltage((i == currentStep && gateHigh) ? 10.f : 0.f);
+			bool gateHigh = false;
+			if (stepBurstActive[i] && clockPeriod > 0.f) {
+				stepBurstSamples[i] += 1.f;
+				float total     = (float)stepBurstTotal[i];
+				float phase     = stepBurstSamples[i] * total * stepBurstSpeed[i] / clockPeriod;
+				float prevPhase = (stepBurstSamples[i] - 1.f) * total * stepBurstSpeed[i] / clockPeriod;
+				float subPhase  = std::fmod(phase, 1.f);
+				gateHigh = (phase < total) && (subPhase < stepBurstLength[i]);
+
+				if (prevPhase < total && phase >= total) {
+					burstEocPulses[i].trigger(1e-3f);
+					stepBurstActive[i] = false;
+				}
+			}
+			outputs[GATE_OUTPUT      + i].setVoltage(gateHigh ? 10.f : 0.f);
 			outputs[BURST_EOC_OUTPUT + i].setVoltage(burstEocPulses[i].process(args.sampleTime) ? 10.f : 0.f);
 		}
 		outputs[EOC_OUTPUT ].setVoltage(eocPulse.process(args.sampleTime) ? 10.f : 0.f);
