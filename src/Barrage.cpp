@@ -46,13 +46,11 @@ struct Barrage : Module {
 	float clockPeriod        = 0.f; // set by onSampleRateChange before first process()
 	float samplesSinceClock  = 0.f;
 
-	// Per-step burst state — allows slow bursts to outlive their clock slot
-	bool  stepBurstActive[NUM_STEPS]  = {};
-	float stepBurstSamples[NUM_STEPS] = {};
-	int   stepBurstTotal[NUM_STEPS]   = {};
-	float stepBurstLength[NUM_STEPS]  = {};
-	float stepBurstSpeed[NUM_STEPS]   = {};
-	bool  pingPongForward              = true;
+	// Burst state for the current step
+	bool  stepActive      = false;
+	int   burstTotal      = 1;
+	float burstLength     = 0.5f;
+	bool  pingPongForward = true;
 
 	Barrage() {
 		config(PARAMS_LEN, INPUTS_LEN, OUTPUTS_LEN, LIGHTS_LEN);
@@ -94,8 +92,7 @@ struct Barrage : Module {
 		if (resetTrigger.process(inputs[RESET_INPUT].getVoltage(), 0.1f, 2.f)) {
 			currentStep     = -1;
 			pingPongForward = true;
-			for (int i = 0; i < NUM_STEPS; i++)
-				stepBurstActive[i] = false;
+			stepActive      = false;
 		}
 
 		// ── Clock ────────────────────────────────────────────────────────────
@@ -106,6 +103,11 @@ struct Barrage : Module {
 			samplesSinceClock = 0.f;
 
 			int prevStep = currentStep;
+
+			// Fire burst EOC for the outgoing step on the clock edge — clock-locked,
+			// so downstream switches get a stable trigger with no drift.
+			if (prevStep >= 0 && stepActive)
+				burstEocPulses[prevStep].trigger(1e-3f);
 
 			switch (dirMode) {
 				case 0: // Forward
@@ -151,36 +153,30 @@ struct Barrage : Module {
 			}
 
 			// Probability gate
-			if (random::uniform() < params[PROB_PARAM + currentStep].getValue()) {
-				stepBurstActive[currentStep]  = true;
-				stepBurstSamples[currentStep] = 0.f;
-				stepBurstTotal[currentStep]   = clamp((int)std::round(params[COUNT_PARAM + currentStep].getValue()), 1, NUM_STEPS);
-				stepBurstLength[currentStep]  = std::min(params[LENGTH_PARAM + currentStep].getValue(), 0.9999f);
-				stepBurstSpeed[currentStep]   = params[SPEED_PARAM + currentStep].getValue();
+			stepActive = (random::uniform() < params[PROB_PARAM + currentStep].getValue());
+
+			if (stepActive) {
+				burstTotal  = clamp((int)std::round(params[COUNT_PARAM + currentStep].getValue()), 1, NUM_STEPS);
+				burstLength = std::min(params[LENGTH_PARAM + currentStep].getValue(), 0.9999f);
 			}
 		}
 
 		samplesSinceClock += 1.f;
 
-		// ── Per-step burst gates ─────────────────────────────────────────────
-		// Each step tracks its own burst independently, so slow bursts (SPEED < 1)
-		// continue firing on their output even after the sequencer has moved on.
-		for (int i = 0; i < NUM_STEPS; i++) {
-			bool gateHigh = false;
-			if (stepBurstActive[i] && clockPeriod > 0.f) {
-				stepBurstSamples[i] += 1.f;
-				float total     = (float)stepBurstTotal[i];
-				float phase     = stepBurstSamples[i] * total * stepBurstSpeed[i] / clockPeriod;
-				float prevPhase = (stepBurstSamples[i] - 1.f) * total * stepBurstSpeed[i] / clockPeriod;
-				float subPhase  = std::fmod(phase, 1.f);
-				gateHigh = (phase < total) && (subPhase < stepBurstLength[i]);
+		// ── Burst gate ───────────────────────────────────────────────────────
+		bool gateHigh = false;
+		if (stepActive && clockPeriod > 0.f) {
+			float speed      = params[SPEED_PARAM + currentStep].getValue();
+			float phase      = samplesSinceClock * (float)burstTotal * speed / clockPeriod;
+			float liveLength = std::min(params[LENGTH_PARAM + currentStep].getValue(), 0.9999f);
+			float subPhase   = std::fmod(phase, 1.f);
+			gateHigh = (phase < (float)burstTotal) && (subPhase < liveLength);
 
-				if (prevPhase < total && phase >= total) {
-					burstEocPulses[i].trigger(1e-3f);
-					stepBurstActive[i] = false;
-				}
-			}
-			outputs[GATE_OUTPUT      + i].setVoltage(gateHigh ? 10.f : 0.f);
+		}
+
+		// ── Outputs ──────────────────────────────────────────────────────────
+		for (int i = 0; i < NUM_STEPS; i++) {
+			outputs[GATE_OUTPUT      + i].setVoltage((i == currentStep && gateHigh) ? 10.f : 0.f);
 			outputs[BURST_EOC_OUTPUT + i].setVoltage(burstEocPulses[i].process(args.sampleTime) ? 10.f : 0.f);
 		}
 		outputs[EOC_OUTPUT ].setVoltage(eocPulse.process(args.sampleTime) ? 10.f : 0.f);
@@ -201,10 +197,10 @@ struct BarragePanel : Widget {
 		box.size = size;
 	}
 
-	// Horizontal separator helper — x2 defaults to just before the sidebar
-	void drawSep(NVGcontext* vg, float y, float x2 = 582.f) {
+	// Horizontal separator helper — spans the main panel, clear of the left sidebar
+	void drawSep(NVGcontext* vg, float y, float x1 = 78.f, float x2 = 654.f) {
 		nvgBeginPath(vg);
-		nvgMoveTo(vg, 6.f, y);
+		nvgMoveTo(vg, x1, y);
 		nvgLineTo(vg, x2, y);
 		nvgStrokeColor(vg, nvgRGB(0x44, 0x44, 0x44));
 		nvgStrokeWidth(vg, 0.8f);
@@ -213,16 +209,16 @@ struct BarragePanel : Widget {
 
 	// Left-aligned section label with a trailing rule
 	void drawSectionLabel(NVGcontext* vg, std::shared_ptr<Font> font,
-	                      float y, const char* label, float ruleX2 = 582.f) {
+	                      float y, const char* label, float ruleX2 = 654.f) {
 		nvgFontFaceId(vg, font->handle);
 		nvgFontSize(vg, 7.5f);
 		nvgTextAlign(vg, NVG_ALIGN_LEFT | NVG_ALIGN_MIDDLE);
 		nvgFillColor(vg, nvgRGB(0x55, 0x55, 0x66));
-		nvgText(vg, 10.f, y, label, NULL);
+		nvgText(vg, 82.f, y, label, NULL);
 
 		// Trailing rule after label text
 		float bounds[4];
-		nvgTextBounds(vg, 10.f, y, label, NULL, bounds);
+		nvgTextBounds(vg, 82.f, y, label, NULL, bounds);
 		nvgBeginPath(vg);
 		nvgMoveTo(vg, bounds[2] + 5.f, y);
 		nvgLineTo(vg, ruleX2, y);
@@ -261,7 +257,7 @@ struct BarragePanel : Widget {
 		// ── Title ──────────────────────────────────────────────────────────
 		nvgFontSize(vg, 11.f);
 		nvgFillColor(vg, nvgRGB(0xff, 0xff, 0xff));
-		nvgText(vg, 294.f, 13.f, "BARRAGE", NULL);
+		nvgText(vg, 366.f, 13.f, "BARRAGE", NULL);
 
 		drawSep(vg, 23.f);
 
@@ -271,7 +267,7 @@ struct BarragePanel : Widget {
 		nvgFillColor(vg, nvgRGB(0x55, 0x55, 0x66));
 		nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
 		for (int i = 0; i < NUM_STEPS; i++) {
-			float x = 28.f + i * 36.25f;
+			float x = 100.f + i * 36.25f;
 			char buf[4];
 			snprintf(buf, sizeof(buf), "%02d", i + 1);
 			nvgText(vg, x, 50.f, buf, NULL);
@@ -291,8 +287,8 @@ struct BarragePanel : Widget {
 		nvgFontSize(vg, 8.5f);
 		nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
 		nvgFillColor(vg, nvgRGB(0x88, 0x88, 0x88));
-		nvgText(vg, 75.f,  208.f, "STEPS", NULL);
-		nvgText(vg, 150.f, 208.f, "DIR",   NULL);
+		nvgText(vg, 147.f, 208.f, "STEPS", NULL);
+		nvgText(vg, 222.f, 208.f, "DIR",   NULL);
 
 		drawSep(vg, 250.f);
 
@@ -309,7 +305,7 @@ struct BarragePanel : Widget {
 		float vonBounds[4], kBounds[4];
 		float vonWidth = nvgTextBounds(vg, 0.f, 360.f, "VON", NULL, vonBounds);
 		float kWidth   = nvgTextBounds(vg, 0.f, 360.f, "K",   NULL, kBounds);
-		float startX   = 294.f - (vonWidth + kWidth) / 2.f;
+		float startX   = 366.f - (vonWidth + kWidth) / 2.f;
 
 		nvgFillColor(vg, nvgRGB(0xf4, 0xf5, 0xf7));
 		nvgText(vg, startX, 360.f, "VON", NULL);
@@ -319,8 +315,8 @@ struct BarragePanel : Widget {
 
 		// ── Sidebar — vertical separator ───────────────────────────────────
 		nvgBeginPath(vg);
-		nvgMoveTo(vg, 588.f, 4.f);
-		nvgLineTo(vg, 588.f, box.size.y - 4.f);
+		nvgMoveTo(vg, 72.f, 4.f);
+		nvgLineTo(vg, 72.f, box.size.y - 4.f);
 		nvgStrokeColor(vg, nvgRGB(0x33, 0x33, 0x33));
 		nvgStrokeWidth(vg, 1.f);
 		nvgStroke(vg);
@@ -329,11 +325,11 @@ struct BarragePanel : Widget {
 		nvgFontSize(vg, 7.5f);
 		nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
 		nvgFillColor(vg, nvgRGB(0x55, 0x55, 0x66));
-		nvgText(vg, 624.f, 82.f, "IN", NULL);
+		nvgText(vg, 36.f, 82.f, "IN", NULL);
 
 		nvgBeginPath(vg);
-		nvgMoveTo(vg, 595.f, 91.f);
-		nvgLineTo(vg, 652.f, 91.f);
+		nvgMoveTo(vg, 6.f, 91.f);
+		nvgLineTo(vg, 66.f, 91.f);
 		nvgStrokeColor(vg, nvgRGB(0x3a, 0x3a, 0x44));
 		nvgStrokeWidth(vg, 0.6f);
 		nvgStroke(vg);
@@ -341,13 +337,13 @@ struct BarragePanel : Widget {
 		nvgFontSize(vg, 8.5f);
 		nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
 		nvgFillColor(vg, nvgRGB(0xcc, 0xcc, 0xcc));
-		nvgText(vg, 624.f, 103.f, "CLK", NULL);
-		nvgText(vg, 624.f, 148.f, "RST", NULL);
+		nvgText(vg, 36.f, 103.f, "CLK", NULL);
+		nvgText(vg, 36.f, 148.f, "RST", NULL);
 
 		// ── Sidebar — separator between inputs and outputs ─────────────────
 		nvgBeginPath(vg);
-		nvgMoveTo(vg, 595.f, 185.f);
-		nvgLineTo(vg, 652.f, 185.f);
+		nvgMoveTo(vg, 6.f, 185.f);
+		nvgLineTo(vg, 66.f, 185.f);
 		nvgStrokeColor(vg, nvgRGB(0x3a, 0x3a, 0x44));
 		nvgStrokeWidth(vg, 0.6f);
 		nvgStroke(vg);
@@ -356,11 +352,11 @@ struct BarragePanel : Widget {
 		nvgFontSize(vg, 7.5f);
 		nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
 		nvgFillColor(vg, nvgRGB(0x55, 0x55, 0x66));
-		nvgText(vg, 624.f, 195.f, "OUT", NULL);
+		nvgText(vg, 36.f, 195.f, "OUT", NULL);
 
 		nvgBeginPath(vg);
-		nvgMoveTo(vg, 595.f, 204.f);
-		nvgLineTo(vg, 652.f, 204.f);
+		nvgMoveTo(vg, 6.f, 204.f);
+		nvgLineTo(vg, 66.f, 204.f);
 		nvgStrokeColor(vg, nvgRGB(0x3a, 0x3a, 0x44));
 		nvgStrokeWidth(vg, 0.6f);
 		nvgStroke(vg);
@@ -368,13 +364,13 @@ struct BarragePanel : Widget {
 		nvgFontSize(vg, 8.5f);
 		nvgTextAlign(vg, NVG_ALIGN_CENTER | NVG_ALIGN_MIDDLE);
 		nvgFillColor(vg, nvgRGB(0x88, 0xcc, 0x88));
-		nvgText(vg, 624.f, 211.f, "EOC",  NULL);
-		nvgText(vg, 624.f, 256.f, "STEP", NULL);
+		nvgText(vg, 36.f, 211.f, "EOC",  NULL);
+		nvgText(vg, 36.f, 256.f, "STEP", NULL);
 
 		// Horizontal rule below all sidebar ports
 		nvgBeginPath(vg);
-		nvgMoveTo(vg, 595.f, 288.f);
-		nvgLineTo(vg, 652.f, 288.f);
+		nvgMoveTo(vg, 6.f, 288.f);
+		nvgLineTo(vg, 66.f, 288.f);
 		nvgStrokeColor(vg, nvgRGB(0x3a, 0x3a, 0x44));
 		nvgStrokeWidth(vg, 0.6f);
 		nvgStroke(vg);
@@ -400,7 +396,7 @@ struct BarrageWidget : ModuleWidget {
 		// ── Per-step knobs ──────────────────────────────────────────────────
 		// 16 columns, each 36.25 px wide, first centre at x=28
 		for (int i = 0; i < NUM_STEPS; i++) {
-			float x = 28.f + i * 36.25f;
+			float x = 100.f + i * 36.25f;
 
 			// Step active LED  (y=37)
 			addChild(createLightCentered<SmallLight<GreenLight>>(Vec(x, 37.f), module, Barrage::STEP_LIGHT + i));
@@ -420,28 +416,28 @@ struct BarrageWidget : ModuleWidget {
 
 		// ── Global controls ─────────────────────────────────────────────────
 		// Sequence length knob  (x=75, y=230)
-		addParam(createParamCentered<RoundBlackKnob>(Vec(75.f, 230.f), module, Barrage::SEQ_LENGTH_PARAM));
+		addParam(createParamCentered<RoundBlackKnob>(Vec(147.f, 230.f), module, Barrage::SEQ_LENGTH_PARAM));
 
-		// Direction toggle button  (x=150, y=230)
-		addParam(createParamCentered<RoundBlackSnapKnob>(Vec(150.f, 230.f), module, Barrage::DIRECTION_PARAM));
+		// Direction knob  (x=222, y=230)
+		addParam(createParamCentered<RoundBlackSnapKnob>(Vec(222.f, 230.f), module, Barrage::DIRECTION_PARAM));
 
 		// ── Gate outputs — one per step, aligned to step columns ────────────
 		for (int i = 0; i < NUM_STEPS; i++) {
-			float x = 28.f + i * 36.25f;
+			float x = 100.f + i * 36.25f;
 			addOutput(createOutputCentered<PJ301MPort>(Vec(x, 280.f), module, Barrage::GATE_OUTPUT + i));
 		}
 
 		// ── Burst EOC outputs — one per step ────────────────────────────────
 		for (int i = 0; i < NUM_STEPS; i++) {
-			float x = 28.f + i * 36.25f;
+			float x = 100.f + i * 36.25f;
 			addOutput(createOutputCentered<PJ301MPort>(Vec(x, 324.f), module, Barrage::BURST_EOC_OUTPUT + i));
 		}
 
 		// ── CLK / RST / EOC / STEP — sidebar ───────────────────────────────
-		addInput(createInputCentered<PJ301MPort>(Vec(624.f, 118.f), module, Barrage::CLOCK_INPUT));
-		addInput(createInputCentered<PJ301MPort>(Vec(624.f, 163.f), module, Barrage::RESET_INPUT));
-		addOutput(createOutputCentered<PJ301MPort>(Vec(624.f, 226.f), module, Barrage::EOC_OUTPUT));
-		addOutput(createOutputCentered<PJ301MPort>(Vec(624.f, 271.f), module, Barrage::STEP_OUTPUT));
+		addInput(createInputCentered<PJ301MPort>(Vec(36.f, 118.f), module, Barrage::CLOCK_INPUT));
+		addInput(createInputCentered<PJ301MPort>(Vec(36.f, 163.f), module, Barrage::RESET_INPUT));
+		addOutput(createOutputCentered<PJ301MPort>(Vec(36.f, 226.f), module, Barrage::EOC_OUTPUT));
+		addOutput(createOutputCentered<PJ301MPort>(Vec(36.f, 271.f), module, Barrage::STEP_OUTPUT));
 	}
 };
 
