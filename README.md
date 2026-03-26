@@ -33,8 +33,9 @@ Barrage is a 16-step sequencer where each step is a self-contained burst generat
 
 | Jack | Description |
 |------|-------------|
-| **CLK** | Clock input — advances the sequencer on each rising edge |
-| **RST** | Reset input — returns to step 1 on the next clock |
+| **CLK** | Burst clock — each rising edge fires one gate on the active step's output. Gate high-time = CLK period × LENGTH. |
+| **STEP** | Step advance — each rising edge moves the sequencer to the next step. |
+| **RST** | Reset input — returns to step 1 on the next step advance. |
 
 ### Outputs
 
@@ -49,7 +50,7 @@ Barrage is a 16-step sequencer where each step is a self-contained burst generat
 
 ## How it works
 
-On each rising clock edge Barrage advances to the next active step, rolls against that step's **PROB** knob, and — if the step fires — begins a burst. The burst divides the clock period into **COUNT** equal time slots. Within each slot the gate is high for the leading **LENGTH** fraction. The **SPEED** multiplier scales how quickly the burst runs through those slots: values above 1× compress the burst into less than one clock period; values below 1× stretch it so the burst may be cut short by the next clock.
+On each rising **STEP** edge Barrage advances to the next active step and rolls against that step's **PROB** knob. On each rising **CLK** edge, if the current step is active and its burst is not yet complete, a gate fires on that step's output. The gate stays high for the leading **LENGTH** fraction of the CLK period, then goes low. This repeats for **COUNT** CLK pulses, after which the burst is complete and the per-step **EOC** fires. Sending a new STEP edge before the burst finishes cuts it short and fires EOC immediately.
 
 Each step has its own **GATE** output, so all 16 burst generators can be routed independently to different instruments or modules simultaneously.
 

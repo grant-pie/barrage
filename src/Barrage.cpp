@@ -44,12 +44,16 @@ struct Barrage : Module {
 	// Sequencer state
 	int   currentStep        = -1;  // -1 = before first clock
 	float clockPeriod        = 0.f; // set by onSampleRateChange before first process()
-	float samplesSinceClock  = 0.f;
+	float samplesSinceClock  = 0.f; // measures period between incoming CLK edges
 
 	// Burst state for the current step
 	bool  stepActive      = false;
 	int   burstTotal      = 1;
 	float burstLength     = 0.5f;
+	float burstSpeed      = 1.f;
+	float burstElapsed    = 0.f;
+	bool  burstEocSent    = true;
+	bool  resetArmed      = false;
 	bool  pingPongForward = true;
 
 	Barrage() {
@@ -93,6 +97,9 @@ struct Barrage : Module {
 			currentStep     = -1;
 			pingPongForward = true;
 			stepActive      = false;
+			burstEocSent    = true;
+			burstElapsed    = 0.f;
+			resetArmed      = true;
 		}
 
 		// ── Clock ────────────────────────────────────────────────────────────
@@ -101,77 +108,94 @@ struct Barrage : Module {
 			if (samplesSinceClock > 0.f && samplesSinceClock < args.sampleRate * 10.f)
 				clockPeriod = samplesSinceClock;
 			samplesSinceClock = 0.f;
-
 			int prevStep = currentStep;
 
-			// Fire burst EOC for the outgoing step on the clock edge — clock-locked,
-			// so downstream switches get a stable trigger with no drift.
-			if (prevStep >= 0 && stepActive)
+			// If a burst is still running when the next clock arrives, end it
+			// explicitly so per-step EOC is never lost at slower burst speeds.
+			if (prevStep >= 0 && stepActive && !burstEocSent) {
 				burstEocPulses[prevStep].trigger(1e-3f);
-
-			switch (dirMode) {
-				case 0: // Forward
-					currentStep++;
-					if (currentStep >= seqLength) {
-						currentStep = 0;
-						if (prevStep >= 0) eocPulse.trigger(1e-3f);
-					}
-					break;
-
-				case 1: // Reverse
-					currentStep--;
-					if (currentStep < 0) {
-						currentStep = seqLength - 1;
-						if (prevStep >= 0) eocPulse.trigger(1e-3f);
-					}
-					break;
-
-				case 2: // Ping-pong
-					if (currentStep < 0) {
-						currentStep     = 0;
-						pingPongForward = true;
-					} else if (pingPongForward) {
-						currentStep++;
-						if (currentStep >= seqLength) {
-							pingPongForward = false;
-							currentStep     = std::max(seqLength - 2, 0);
-						}
-					} else {
-						currentStep--;
-						if (currentStep < 0) {
-							pingPongForward = true;
-							currentStep     = std::min(1, seqLength - 1);
-							if (prevStep >= 0) eocPulse.trigger(1e-3f);
-						}
-					}
-					break;
-
-				case 3: // Random
-				default:
-					currentStep = (int)(random::uniform() * seqLength);
-					break;
+				burstEocSent = true;
 			}
 
-			// Probability gate
+			if (resetArmed) {
+				currentStep = 0;
+				pingPongForward = true;
+				resetArmed = false;
+			} else {
+				switch (dirMode) {
+					case 0: // Forward
+						currentStep++;
+						if (currentStep >= seqLength) {
+							currentStep = 0;
+							if (prevStep >= 0) eocPulse.trigger(1e-3f);
+						}
+						break;
+
+					case 1: // Reverse
+						currentStep--;
+						if (currentStep < 0) {
+							currentStep = seqLength - 1;
+							if (prevStep >= 0) eocPulse.trigger(1e-3f);
+						}
+						break;
+
+					case 2: // Ping-pong
+						if (currentStep < 0) {
+							currentStep     = 0;
+							pingPongForward = true;
+						} else if (pingPongForward) {
+							currentStep++;
+							if (currentStep >= seqLength) {
+								pingPongForward = false;
+								currentStep     = std::max(seqLength - 2, 0);
+							}
+						} else {
+							currentStep--;
+							if (currentStep < 0) {
+								pingPongForward = true;
+								currentStep     = std::min(1, seqLength - 1);
+								if (prevStep >= 0) eocPulse.trigger(1e-3f);
+							}
+						}
+						break;
+
+					case 3: // Random
+					default:
+						currentStep = (int)(random::uniform() * seqLength);
+						break;
+				}
+			}
+
+			// Per-step probability and burst setup (latched on step entry).
 			stepActive = (random::uniform() < params[PROB_PARAM + currentStep].getValue());
+			burstElapsed = 0.f;
+			burstEocSent = !stepActive;
 
 			if (stepActive) {
 				burstTotal  = clamp((int)std::round(params[COUNT_PARAM + currentStep].getValue()), 1, NUM_STEPS);
 				burstLength = std::min(params[LENGTH_PARAM + currentStep].getValue(), 0.9999f);
+				burstSpeed  = params[SPEED_PARAM + currentStep].getValue();
 			}
 		}
 
 		samplesSinceClock += 1.f;
+		burstElapsed += 1.f;
 
 		// ── Burst gate ───────────────────────────────────────────────────────
 		bool gateHigh = false;
 		if (stepActive && clockPeriod > 0.f) {
-			float speed      = params[SPEED_PARAM + currentStep].getValue();
-			float phase      = samplesSinceClock * (float)burstTotal * speed / clockPeriod;
-			float liveLength = std::min(params[LENGTH_PARAM + currentStep].getValue(), 0.9999f);
-			float subPhase   = std::fmod(phase, 1.f);
-			gateHigh = (phase < (float)burstTotal) && (subPhase < liveLength);
+			float phase    = burstElapsed * (float)burstTotal * burstSpeed / clockPeriod;
+			float subPhase = std::fmod(phase, 1.f);
+			bool  done     = (phase >= (float)burstTotal);
 
+			if (done && !burstEocSent && currentStep >= 0) {
+				burstEocPulses[currentStep].trigger(1e-3f);
+				burstEocSent = true;
+			}
+
+			if (!done) {
+				gateHigh = (subPhase < burstLength);
+			}
 		}
 
 		// ── Outputs ──────────────────────────────────────────────────────────
